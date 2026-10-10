@@ -1,0 +1,450 @@
+#!/bin/sh
+#
+# QZcam 自启脚本：开机直接进相机，没有桌面。
+#
+# 两种装法（和 QZdesk 一样，两份都装、靠 running() 防重复启动）：
+#   /etc/init.d/S30qzcam        rootfs 的 rcS 会跑
+#   /oem/usr/etc/init.d/S30qzcam oem 的 RkLunch 会跑
+#
+# 排在 S30：oem 挂载（S20linkmount）之后就能起，不必等网络。
+#
+# 环境变量（改这里即可，不用重编程序）：
+#   QZCAM_FB        framebuffer 节点（默认 /dev/fb0）
+#   QZCAM_TOUCH     触摸输入节点（默认 /dev/input/event0）
+#   QZCAM_CAPTURE   向驱动请求的采集尺寸（默认 640x480）
+#   QZCAM_DIR       照片目录（不设则 SD 卡优先：/mnt/sdcard → /userdata/qzcam）
+#   QZCAM_BACKEND   fake|v4l2，默认走真机（fake 只在自检时用）
+#
+# 出问题时的排查入口（不用连串口）：
+#   /userdata/qzcam-boot.log   开机自检报告（模块/节点/media/i2c/dmesg 快照）
+#   /var/log/qzcam.log         启动脚本与程序的日志
+# 名字探测失败时可以钉死节点：echo /dev/video15 > /oem/usr/etc/qzcam-dev
+#
+DAEMON=/oem/usr/bin/qzcam
+WORKDIR=/oem/usr/bin
+LOG=/var/log/qzcam.log
+PIDFILE=/var/run/qzcam.pid
+CAM_KO=/oem/usr/lib/camera      # SC3336 + rkcif/rkisp 驱动模块（镜像没带，随包放 oem）
+REPLACE_SH=/oem/usr/share/qzcam/replace_desktop.sh  # 桌面接管脚本（随镜像装在 oem）
+MODE_FILE=/oem/usr/etc/qzcam-mode    # 出图路径：lcd（默认）| rtsp（rkipc 推流）| uvc（UVC 模拟）
+READY_WAIT=50                   # 就绪等待：50 × 100ms = 5 秒
+LOG_MAX=$((512 * 1024))
+
+export QZCAM_FB=${QZCAM_FB:-/dev/fb0}
+# auto = 由程序按"有绝对坐标轴"自动认触摸屏（FocalTech FTS）；也可钉死节点，
+# 例如 QZCAM_TOUCH=/dev/input/event1（调试时用）
+export QZCAM_TOUCH=${QZCAM_TOUCH:-auto}
+# 采集分辨率不在脚本里钉死：应用按 设置→分辨率（默认 2304x1296 全尺寸）请求，
+# 否则照片永远只有 640x480（糊）。要用环境变量临时实验时自己 export。
+# 照片/录像的落盘目录**不在脚本里钉死**：cam_storage 自己按
+# /mnt/sdcard（SD 卡）→ /userdata/qzcam（flash）→ /tmp 的顺序挑第一个可写的。
+# 这里负责把 SD 卡挂上：S30 跑得早，mmc 探测可能还没完成，所以要等；
+# 设备名多试几个（有无分区表都可能），文件系统显式 vfat 再兜底自动识别。
+if ! grep -q " /mnt/sdcard " /proc/mounts 2>/dev/null; then
+	mkdir -p /mnt/sdcard 2>/dev/null
+	tries=0
+	mounted=0
+	while [ $tries -lt 10 ]; do
+		for part in /dev/mmcblk1p1 /dev/mmcblk0p1 /dev/mmcblk1 /dev/mmcblk0; do
+			[ -b "$part" ] || continue
+			if mount -t vfat "$part" /mnt/sdcard 2>/dev/null ||
+			   mount "$part" /mnt/sdcard 2>/dev/null; then
+				echo "qzcam: SD 卡已挂载 $part -> /mnt/sdcard" >>"$LOG"
+				mounted=1
+				break
+			fi
+		done
+		[ $mounted = 1 ] && break
+		grep -q " /mnt/sdcard " /proc/mounts 2>/dev/null && { mounted=1; break; }
+		tries=$((tries + 1))
+		usleep 500000 2>/dev/null || sleep 1
+	done
+	[ $mounted = 0 ] && ! grep -q " /mnt/sdcard " /proc/mounts 2>/dev/null && \
+		echo "qzcam: SD 卡未挂载（无卡/文件系统不支持/无设备），媒体落 flash" >>"$LOG"
+	ls /dev/mmcblk* >/dev/null 2>&1 || \
+		echo "qzcam: 内核没有枚举到任何 SD 设备（卡没插/卡槽未使能）" >>"$LOG"
+fi
+# 虚拟触摸屏守护：远程桌面/自动化往 /tmp/qz-touch.fifo 写 tap/swipe。
+# 有真触摸屏也不冲突（qzcam 优先用真屏；uitap 多挂一颗虚拟设备而已）。
+[ -f "$CAM_KO/uinput.ko" ] && [ -e /dev/uinput ] || \
+	insmod "$CAM_KO/uinput.ko" 2>/dev/null
+if [ -x /oem/usr/bin/uitap ] && [ -e /dev/uinput ] && ! pidof uitap >/dev/null 2>&1; then
+	/oem/usr/bin/uitap >/dev/null 2>&1 &
+	echo "qzcam: uitap 虚拟触摸屏已启动" >>"$LOG"
+fi
+
+# 名字探测失败（或想试别的通道）时钉死节点，不用重编程序
+if [ -f /oem/usr/etc/qzcam-dev ]; then
+	QZCAM_DEV=$(cat /oem/usr/etc/qzcam-dev 2>/dev/null | tr -d ' \t\r\n')
+	[ -n "$QZCAM_DEV" ] && export QZCAM_DEV
+fi
+
+# 运行库搜索路径：librkaiq/librockit/librockchip_mpp/librga 装在 /oem/usr/lib，
+# 而 uClibc 默认只找 /lib 与 /usr/lib（镜像里没有 /etc/ld.so.conf），所以必须显式
+# 指给动态加载器 —— 否则 qzcam 起不来（报 cannot load shared libraries）。
+export LD_LIBRARY_PATH=/oem/usr/lib:/usr/lib:$LD_LIBRARY_PATH
+
+running() {
+	# 1) 按 PID 文件（正常路径）
+	if [ -f "$PIDFILE" ]; then
+		pid=$(cat "$PIDFILE" 2>/dev/null)
+		[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 0
+	fi
+	# 2) 兜底按进程名：两份 init 脚本会同时跑，只看 PID 文件会竞态起两份，
+	#    两个进程抢同一个 framebuffer → 花屏。
+	[ -n "$(ps | grep '[q]zcam' | grep -v init.d)" ]
+}
+
+# 相机模块：必须在拉起 qzcam **之前**加载完 —— 这个程序一启动就开摄像头。
+# 顺序不能换：rk_dvbm 是 ISP 的 buffer manager；csi2-dphy-hw/dphy 必须先于
+# video_rkcif（rkcif 里打包着 mipi-csi2 桥驱动，桥 probe 时要求 dphy 已就绪，
+# 否则 -22 硬失败，桥永远缺席 → CIF 找不到远端传感器）。
+#
+# clr_unready_dev 抄自 Echo-Mate 的 insmod_ko.sh：传感器还没挂上时 rkcif/rkisp
+# 的异步 notifier 会把设备标成 unready 而不注册 /dev/videoN，写 1 强制补注册。
+load_camera() {
+	[ -d "$CAM_KO" ] || { echo "qzcam: 没有 $CAM_KO，跳过模块加载" >>"$LOG"; return 0; }
+	[ -e "$CAM_KO/disable" ] && { echo "qzcam: 相机模块已禁用" >>"$LOG"; return 0; }
+
+	# 高速模式：录像帧率 >30 时（qzcam 落的标记），传感器用社区 640x480@75fps
+	# 驱动（LuckfoxTECH/luckfox-pico#67），并把配套 IQ 摆到 rkaiq 认的标准名。
+	HI=0
+	[ -f /oem/usr/etc/qzcam-hispeed ] && HI=1
+
+	for m in rk_dvbm video_rkcif video_rkisp \
+	         phy-rockchip-csi2-dphy-hw phy-rockchip-csi2-dphy rga3 mpp_vcodec; do
+		[ -f "$CAM_KO/$m.ko" ] || continue
+		grep -q "^$m " /proc/modules 2>/dev/null && continue
+		out=$(insmod "$CAM_KO/$m.ko" 2>&1)
+		[ -n "$out" ] && echo "qzcam: 模块 $m: $out" >>"$LOG"
+	done
+
+	# 传感器驱动二选一：高速(75fps, 仅 640x480) 或 标准(2304x1296@30)
+	if [ "$HI" = 1 ] && [ -f "$CAM_KO/sc3336_75.ko" ]; then
+		grep -q "^sc3336 " /proc/modules 2>/dev/null || {
+			out=$(insmod "$CAM_KO/sc3336_75.ko" 2>&1)
+			[ -n "$out" ] && echo "qzcam: 模块 sc3336_75(高速): $out" >>"$LOG"
+		}
+		echo "qzcam: 高速模式（640x480@75fps）" >>"$LOG"
+	else
+		[ -f "$CAM_KO/sc3336.ko" ] && ! grep -q "^sc3336 " /proc/modules 2>/dev/null && {
+			out=$(insmod "$CAM_KO/sc3336.ko" 2>&1)
+			[ -n "$out" ] && echo "qzcam: 模块 sc3336: $out" >>"$LOG"
+		}
+	fi
+	# IQ 文件按模式摆到 rkaiq 认的标准名（/etc/iqfiles 软链到这里，改的就是 oem）
+	IQDIR=/oem/usr/share/iqfiles
+	IQNAME=sc3336_CMK-OT2119-PC1_30IRC-F16.json
+	if [ "$HI" = 1 ] && [ -f "$IQDIR/$IQNAME.hispeed.json" ]; then
+		cmp -s "$IQDIR/$IQNAME.hispeed.json" "$IQDIR/$IQNAME" || \
+			cp -f "$IQDIR/$IQNAME.hispeed.json" "$IQDIR/$IQNAME" 2>/dev/null
+	elif [ -f "$IQDIR/sc3336_30fps.json" ]; then
+		cmp -s "$IQDIR/sc3336_30fps.json" "$IQDIR/$IQNAME" || \
+			cp -f "$IQDIR/sc3336_30fps.json" "$IQDIR/$IQNAME" 2>/dev/null
+	fi
+
+	echo 1 > /sys/module/video_rkcif/parameters/clr_unready_dev 2>/dev/null
+	echo 1 > /sys/module/video_rkisp/parameters/clr_unready_dev 2>/dev/null
+
+	# rockit.ko 必须**最后**加载（抄 Echo-Mate 的 insmod_ko.sh）：
+	# 它是 MPI(VI/VENC) 的内核侧，ISP 的取景就走它；isp_max_h 要等于 sensor 的
+	# 有效行数（SC3336 = 1296），给小了 ISP buffer 不够分配会直接失败。
+	# mcu_fw_path 是相对路径，所以先 cd 到模块目录。
+	if [ -f "$CAM_KO/rockit.ko" ] && ! grep -q "^rockit " /proc/modules 2>/dev/null; then
+		out=$(cd "$CAM_KO" && insmod ./rockit.ko mcu_fw_path="./hpmcu_wrap.bin" \
+			mcu_fw_addr=0xff6ff000 isp_max_h=1296 2>&1)
+		[ -n "$out" ] && echo "qzcam: 模块 rockit: $out" >>"$LOG"
+	fi
+
+	i=0
+	while [ "$i" -lt 30 ]; do
+		ls /dev/video* >/dev/null 2>&1 && break
+		usleep 100000 2>/dev/null || sleep 1
+		i=$((i + 1))
+	done
+
+	# 光有 /dev/videoN 不算成功：QZcam 取景要的是 rkisp_mainpath（ISP 主通道）。
+	# 它没注册出来，程序就只能是"相机未就绪"——把这个结论写进日志和自检报告。
+	mainpath=$(find_mainpath)
+	if [ -n "$mainpath" ]; then
+		echo "qzcam: 取景节点 $mainpath（$(cat "$mainpath/name" 2>/dev/null)）" >>"$LOG"
+	else
+		echo "qzcam: **没找到 rkisp_mainpath**，相机取不了景。现有节点：$(ls /dev/video* 2>/dev/null | tr '\n' ' ')" >>"$LOG"
+	fi
+	[ "$HI" = 1 ] && echo "qzcam: 传感器=高速(640x480@75fps)" >>"$LOG" || echo "qzcam: 传感器=标准(2304x1296@30fps)" >>"$LOG"
+	camera_report
+}
+
+# rkisp_mainpath 对应哪个 /dev/videoN —— sysfs 里的名字是权威来源（编号不固定）
+find_mainpath() {
+	for f in /sys/class/video4linux/video*/name; do
+		[ -f "$f" ] || continue
+		if [ "$(cat "$f" 2>/dev/null)" = "rkisp_mainpath" ]; then
+			echo "/dev/$(basename "$(dirname "$f")")"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# 一份自包含的相机现场快照。相机的问题全在板子上，有这份报告就不用连串口：
+# 模块有没有加载、节点有没有注册、i2c 上认没认到传感器、驱动 dmesg 怎么说。
+camera_report() {
+	R=/userdata/qzcam-boot.log
+	[ -d /userdata ] || R=/tmp/qzcam-boot.log
+	{
+		echo "== QZcam 相机自检 $(date 2>/dev/null) =="
+		echo "机型: $(cat /proc/device-tree/model 2>/dev/null)"
+		echo "-- 已加载模块 --"
+		grep -E "rk_dvbm|rkisp|rkcif|sc3336|csi2" /proc/modules 2>/dev/null | awk '{print "  "$1" "$3}'
+		echo "-- 视频节点 --"
+		for f in /sys/class/video4linux/video*/name; do
+			[ -f "$f" ] && echo "  /dev/$(basename "$(dirname "$f")") = $(cat "$f")"
+		done
+		echo "-- media 设备 --"
+		ls /dev/media* 2>/dev/null | tr '\n' ' '
+		echo
+		echo "-- i2c 设备（找 0x30 上的传感器）--"
+		for d in /sys/bus/i2c/devices/*/name; do
+			[ -f "$d" ] || continue
+			echo "  $(basename "$(dirname "$d")") = $(cat "$d")"
+		done
+		echo "-- 占用摄像头的进程 --"
+		ps | grep -E "[r]kipc|[q]zcam|[r]k_mpi" | awk '{print "  "$0}'
+		echo "-- 输入设备（触摸屏那条应带 ABS 轴）--"
+		for d in /sys/class/input/event*; do
+			[ -e "$d/device/name" ] || continue
+			echo "  /dev/$(basename "$d") = $(cat "$d/device/name" 2>/dev/null)"
+		done
+		echo "-- ISP 的 IQ 文件（rkaiq 按 sensor 名找）--"
+		ls /etc/iqfiles/ 2>/dev/null | grep -i sc3336 | sed 's/^/  /'
+		echo "-- Rockchip 运行库 --"
+		for so in librkaiq.so librockit_full.so librockchip_mpp.so.0 librga.so \
+				librkmuxer.so librkdemuxer.so; do
+			[ -f "/oem/usr/lib/$so" ] && echo "  [有] $so" || echo "  [缺] $so"
+		done
+		echo "-- dmesg 相机相关（末尾 25 行）--"
+		dmesg 2>/dev/null | grep -iE "sc3336|rkisp|rkcif|csi2|dphy|mipi|rockit" | tail -25
+	} > "$R" 2>/dev/null
+	echo "qzcam: 相机自检报告 -> $R" >>"$LOG"
+}
+
+# SDK 默认的相机程序 rkipc（RK_APP_TYPE=RKIPC_RV1106 带进来的）会在开机时被
+# RkLunch 拉起并**占住 /dev/video***（它跑 RTSP 推流）。QZcam 要独占 CSI 才能取景，
+# 不然 open() 直接 EBUSY、界面只能落到彩条测试后端。
+#
+# 官方 CSI 文档也是这么做的："CSI 摄像头（需要先关掉自带的 RKIPC）：killall rkipc"。
+HOGCAM="rkipc rk_mpi_uvc"
+
+# 进程名匹配：用 [x]xx 的写法避开 grep 自己（ps | grep rkipc 会命中 grep 自身）
+proc_running() {
+	first=$(printf '%s' "$1" | cut -c1)
+	rest=$(printf '%s' "$1" | cut -c2-)
+	[ -n "$(ps | grep "[$first]$rest")" ]
+}
+
+stop_camera_hogs() {
+	busy=0
+	for p in $HOGCAM; do
+		if proc_running "$p"; then
+			killall "$p" 2>/dev/null
+			echo "qzcam: 停掉占用摄像头的 $p" >>"$LOG"
+			busy=1
+		fi
+	done
+
+	# RkLunch 是 oem 的托管脚本，会把 rkipc 再拉起来，先停掉它
+	if [ -x /oem/usr/bin/RkLunch-stop.sh ]; then
+		/oem/usr/bin/RkLunch-stop.sh >>"$LOG" 2>&1
+		echo "qzcam: 已执行 RkLunch-stop.sh（停掉 SDK 托管应用）" >>"$LOG"
+	fi
+
+	# 等它们真正退出：驱动要几百毫秒关流、释放 buffer，抢早了会 EBUSY
+	i=0
+	while [ "$i" -lt 20 ]; do
+		still=0
+		for p in $HOGCAM; do
+			proc_running "$p" && still=1
+		done
+		[ "$still" = 0 ] && break
+		killall $HOGCAM 2>/dev/null
+		usleep 100000 2>/dev/null || sleep 1
+		i=$((i + 1))
+	done
+	[ "$busy" = 1 ] && echo "qzcam: 摄像头已让出来（等 $i × 100ms）" >>"$LOG"
+	return 0
+}
+
+wait_ready() {
+	i=0
+	while [ "$i" -lt "$READY_WAIT" ]; do
+		[ -x "$DAEMON" ] && [ -e "$QZCAM_FB" ] && return 0
+		usleep 100000 2>/dev/null || sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+desktop_running() {
+	[ -n "$(ps | grep '[q]zdesk_screen')" ]
+}
+
+# 这是"相机固件"：桌面不该再起，否则两个界面抢同一个 framebuffer，屏幕就会在
+# QZcam 与 QZdesk 之间来回跳（rcS/RkLunch 按字典序把 S30qzcam、S30qzdesk 都跑了）。
+#
+# 接管逻辑单独成一个脚本（replace_desktop.sh，随镜像装在 /oem/usr/share/qzcam/）：
+# 好处是烧录后随时能手动跑一次做"替换"，不用重刷，也不用改 SDK。开机走 --boot
+# 模式：停用桌面自启 + 杀进程 + 桌面二进制换成指向 qzcam 的软链（不重启相机，
+# 因为此刻相机正由本脚本拉起）。
+disarm_desktop() {
+	if [ -f "$REPLACE_SH" ]; then
+		sh "$REPLACE_SH" --boot >>"$LOG" 2>&1
+		return 0
+	fi
+
+	# 老 oem 上还没有 replace_desktop.sh 时的内联兜底：至少停自启 + 杀进程。
+	echo "qzcam: 没有 $REPLACE_SH，用内联兜底接管桌面" >>"$LOG"
+	changed=0
+	for f in /oem/usr/etc/init.d/S30qzdesk /etc/init.d/S30qzdesk \
+	         /oem/usr/etc/init.d/S99qzdesk /etc/init.d/S99qzdesk; do
+		[ -f "$f" ] || continue
+		if mv "$f" "$f.disabled" 2>/dev/null; then
+			echo "qzcam: 已停用桌面自启 $f -> $f.disabled" >>"$LOG"
+			changed=1
+		else
+			mount -o remount,rw / 2>/dev/null
+			if mv "$f" "$f.disabled" 2>/dev/null; then
+				echo "qzcam: 已停用桌面自启 $f（重挂 rw 后）" >>"$LOG"
+				changed=1
+			else
+				echo "qzcam: 停用 $f 失败（只读？），改用进程看护" >>"$LOG"
+			fi
+		fi
+	done
+
+	if desktop_running; then
+		killall qzdesk_screen 2>/dev/null
+		echo "qzcam: 已杀掉在跑的桌面进程 qzdesk_screen" >>"$LOG"
+		changed=1
+	fi
+
+	[ "$changed" = 0 ] && echo "qzcam: 没有桌面脚本/进程，无需处理" >>"$LOG"
+	return 0
+}
+
+# 看护：RkLunch 是循环跑 /oem/usr/etc/init.d/* 的，脚本被停用前可能已经把桌面
+# 拉起来，或有别的路径重启它。启动相机后盯一段时间，见到桌面就杀。
+guard_desktop() {
+	i=0
+	while [ "$i" -lt 20 ]; do
+		if desktop_running; then
+			killall qzdesk_screen 2>/dev/null
+			echo "qzcam: 看护中杀掉又冒出来的桌面（第 $i 次检查）" >>"$LOG"
+		fi
+		usleep 1000000 2>/dev/null || sleep 1
+		i=$((i + 1))
+	done
+}
+
+# 出图路径三选一，靠 /oem/usr/etc/qzcam-mode 切换（默认 lcd）：
+#   lcd  —— QZcam 自己在 LCD 上取景（会停掉 rkipc，独占 /dev/video*）
+#   rtsp —— 由 rkipc 推流 rtsp://<ip>/live/0（QZcam 不启动）
+#   uvc  —— 走 UVC 模拟，主机识别成摄像头（QZcam 不启动）
+# 三者互斥：摄像头同一时刻只能被一个进程打开，所以每个模式都要先把别的停掉。
+camera_mode() {
+	m=$(cat "$MODE_FILE" 2>/dev/null | tr -d ' \t\r\n')
+	case "$m" in
+		rtsp|uvc|lcd) echo "$m" ;;
+		*) echo lcd ;;
+	esac
+}
+
+# rkipc 由 SDK 的 RkLunch 托管；模式切到 rtsp 时确保它在跑
+ensure_rkipc() {
+	if [ -n "$(ps | grep '[r]kipc')" ]; then
+		echo "qzcam: rkipc 已在运行（RTSP 推流中）" >>"$LOG"
+		return 0
+	fi
+	if [ -x /oem/usr/bin/rkipc ]; then
+		( cd /oem/usr/bin && ./rkipc >>"$LOG" 2>&1 & )
+		echo "qzcam: 已启动 rkipc（RTSP）" >>"$LOG"
+		return 0
+	fi
+	echo "qzcam: 镜像里没有 rkipc，RTSP 模式不可用（用 tools/build/build_image.sh --camera-demo 重新打）" >>"$LOG"
+	return 1
+}
+
+# UVC 模拟：先切 USB 到 UVC 功能，再跑 uvc 程序（命名随 SDK：uvc_app / rk_mpi_uvc）
+start_uvc() {
+	if [ -x /oem/usr/bin/usb_config.sh ]; then
+		sh /oem/usr/bin/usb_config.sh >>"$LOG" 2>&1
+		echo "qzcam: 已执行 usb_config.sh（USB 切到 UVC）" >>"$LOG"
+	fi
+	for bin in /oem/usr/bin/uvc_app /oem/usr/bin/rk_mpi_uvc; do
+		[ -x "$bin" ] || continue
+		( cd /oem/usr/bin && "$bin" >>"$LOG" 2>&1 & )
+		echo "qzcam: 已启动 UVC 程序 $(basename "$bin")" >>"$LOG"
+		return 0
+	done
+	echo "qzcam: 没找到 UVC 程序（uvc_app / rk_mpi_uvc）" >>"$LOG"
+	return 1
+}
+
+start() {
+	running && { echo "qzcam: 已在运行，跳过"; return 0; }
+	mkdir -p /var/log /var/run
+	mkdir -p /var/log /var/run
+	[ -f "$LOG" ] && [ "$(wc -c <"$LOG" 2>/dev/null || echo 0)" -gt "$LOG_MAX" ] && : >"$LOG"
+
+	disarm_desktop
+
+	# 出图模式分流（见 camera_mode 的说明）：rtsp / uvc 两种模式都不启动 QZcam，
+	# 而是把摄像头让给对应的程序；lcd 是默认，往下走原来的流程。
+	mode=$(camera_mode)
+	case "$mode" in
+	rtsp)
+		echo "qzcam: 出图模式 rtsp —— QZcam 不启动，交给 rkipc 推流" >>"$LOG"
+		load_camera
+		ensure_rkipc
+		( guard_desktop ) >/dev/null 2>&1 &
+		return 0
+		;;
+	uvc)
+		echo "qzcam: 出图模式 uvc —— QZcam 不启动，交给 UVC 程序" >>"$LOG"
+		killall rkipc 2>/dev/null
+		stop_camera_hogs
+		load_camera
+		start_uvc
+		( guard_desktop ) >/dev/null 2>&1 &
+		return 0
+		;;
+	esac
+
+	wait_ready || echo "qzcam: 就绪等待超时，仍尝试启动" >>"$LOG"
+	[ -x "$DAEMON" ] || { echo "qzcam: 找不到 $DAEMON"; return 1; }
+
+	cd "$WORKDIR" || return 1
+	echo "qzcam: 启动 uptime=$(cut -d' ' -f1 /proc/uptime)" >>"$LOG"
+	stop_camera_hogs   # 必须早于相机启动：rkipc 占着 /dev/video* 就打不开
+	load_camera
+	"$DAEMON" >>"$LOG" 2>&1 &
+	echo $! >"$PIDFILE"
+	# 看护放后台，别挡住 init（rcS 是串行的）
+	( guard_desktop ) >/dev/null 2>&1 &
+	echo "qzcam: 已启动（pid $(cat $PIDFILE)），日志 $LOG"
+}
+
+stop() {
+	[ -f "$PIDFILE" ] && { kill "$(cat $PIDFILE)" 2>/dev/null; rm -f "$PIDFILE"; }
+	# 三种模式的进程都停掉：切换模式时不会留下"占着摄像头"的残留
+	killall qzcam uvc_app rk_mpi_uvc 2>/dev/null
+	echo "qzcam: 已停止（当前模式 $(camera_mode)）"
+}
+
+case "$1" in
+	start)   start ;;
+	stop)    stop ;;
+	restart) stop; sleep 1; start ;;
+	status)  running && echo "qzcam: 运行中" || echo "qzcam: 未运行" ;;
+	*)       echo "usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

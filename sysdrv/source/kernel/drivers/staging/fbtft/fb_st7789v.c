@@ -33,7 +33,7 @@
  * Keep this separate from HSD20_IPS because HSD20_IPS also selects
  * panel-specific gamma and power settings.
  */
-#define ST7789V_COLOR_INVERT 1
+#define ST7789V_COLOR_INVERT 0
 
 /**
  * enum st7789v_command - ST7789V display controller commands

@@ -1140,8 +1140,14 @@
 		status = "disabled";
 	};
 
-	mipi0_csi2: mipi-csi2@ffa20000 {
-		compatible = "rockchip,rk3588-mipi-csi2";
+
+
+
+
+	/* CSI2 主控(hw) + 驱动实例：与本内核自带的 rv1106 版驱动匹配。
+	 * 实例的 ports 由 rv1106-qzdesk-ipc.dtsi 的 &mipi0_csi2 提供。 */
+	mipi0_csi2_hw: mipi-csi2-hw@ffa20000 {
+		compatible = "rockchip,rv1106-mipi-csi2-hw";
 		reg = <0xffa20000 0x10000>;
 		reg-names = "csihost_regs";
 		interrupts = <GIC_SPI 99 IRQ_TYPE_LEVEL_HIGH>,
@@ -1151,11 +1157,11 @@
 		clock-names = "pclk_csi2host", "clk_rxbyte_hs";
 		resets = <&cru SRST_P_CSIHOST0>;
 		reset-names = "srst_csihost_p";
-		status = "disabled";
+		status = "okay";
 	};
 
-	mipi1_csi2: mipi-csi2@ffa30000 {
-		compatible = "rockchip,rk3588-mipi-csi2";
+	mipi1_csi2_hw: mipi-csi2-hw@ffa30000 {
+		compatible = "rockchip,rv1106-mipi-csi2-hw";
 		reg = <0xffa30000 0x10000>;
 		reg-names = "csihost_regs";
 		interrupts = <GIC_SPI 101 IRQ_TYPE_LEVEL_HIGH>,
@@ -1165,8 +1171,15 @@
 		clock-names = "pclk_csi2host", "clk_rxbyte_hs";
 		resets = <&cru SRST_P_CSIHOST1>;
 		reset-names = "srst_csihost_p";
-		status = "disabled";
+		status = "okay";
 	};
+
+	mipi0_csi2: mipi0-csi2 {
+		compatible = "rockchip,rv1106-mipi-csi2";
+		rockchip,hw = <&mipi0_csi2_hw>, <&mipi1_csi2_hw>;
+		status = "okay";
+	};
+
 
 	rkvenc: rkvenc@ffa50000 {
 		compatible = "rockchip,rkv-encoder-rv1106";
