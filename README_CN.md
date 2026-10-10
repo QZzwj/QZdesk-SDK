@@ -1,26 +1,3 @@
-<!-- 📦 本段由 sync-to-gitee.sh 自动生成，请勿手动编辑 -->
-
-## 📦 Gitee 快照镜像
-
-本仓库是 [LuckfoxTECH/luckfox-pico](https://github.com/LuckfoxTECH/luckfox-pico) 的国内加速镜像（仅最新代码、无提交历史），同步自上游 `824b817f`（2026-03-22）。
-
-受 Gitee 单仓库容量限制，`tools/`（交叉编译工具链、烧录工具）拆分为独立仓库，并以 git 子模块挂回本仓库。克隆时加 `--recursive`，tools 会自动放到原位：
-
-```bash
-git clone --recursive https://gitee.com/LuckfoxTECH/luckfox-pico.git
-```
-
-已克隆过的仓库，补一次子模块：
-
-```bash
-cd luckfox-pico
-git submodule update --init
-```
-
-> 完整原始仓库请访问上游 GitHub。
-
----
-
 # QZdesk SDK (RV1106)
 
 基于 Luckfox 的 **RV1106** SDK。它是 **QZdesk**（桌面）和 **QZcam**（相机）的依赖：
