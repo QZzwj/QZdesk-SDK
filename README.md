@@ -23,8 +23,9 @@ git submodule update --init
 
 # QZdesk SDK (RV1106)
 
-Firmware SDK for the RV1106 DeskMate board — a trimmed fork of the Luckfox Pico SDK,
-with our own UI apps on top and a one-command firmware pipeline.
+Based on the Luckfox Pico **RV1106** SDK. This is the SDK that **QZdesk** (desktop) and
+**QZcam** (camera) depend on: board config, driver patches, media libraries, and a
+one-command firmware pipeline.
 
 [简体中文](./README_CN.md) · Upstream docs: [LuckfoxTECH/luckfox-pico](https://github.com/LuckfoxTECH/luckfox-pico)
 
@@ -56,8 +57,9 @@ ln -s project/cfg/BoardConfig_IPC/BoardConfig-SPI_NAND-Buildroot-RV1106_QZdesk-D
 # or interactively:  ./build.sh lunch
 ```
 
-> The app sources for `qzcam` / `qzdesk` live in their own repos and are linked in as
-> `project/app/*/src`. Without them only the SDK-side apps (`rkipc`, `uvc_app_tiny`, …) build.
+> **QZdesk** (desktop) and **QZcam** (camera) are separate repos, linked in as
+> `project/app/*/src` — this SDK provides their cross toolchain, kernel/rootfs and the `oem`
+> tree they install into. Without them only the SDK-side apps (`rkipc`, `uvc_app_tiny`, …) build.
 
 ## Build
 

@@ -23,8 +23,8 @@ git submodule update --init
 
 # QZdesk SDK (RV1106)
 
-RV1106 DeskMate 板子的固件 SDK —— 基于 Luckfox Pico SDK 裁剪定制，上层是我们自己的
-界面应用，固件用一条命令产出。
+基于 Luckfox 的 **RV1106** SDK。它是 **QZdesk**（桌面）和 **QZcam**（相机）的依赖：
+板级配置、驱动补丁、媒体库，以及一条命令出固件。
 
 [English](./README.md) · 上游文档：[LuckfoxTECH/luckfox-pico](https://github.com/LuckfoxTECH/luckfox-pico)
 
@@ -56,8 +56,9 @@ ln -s project/cfg/BoardConfig_IPC/BoardConfig-SPI_NAND-Buildroot-RV1106_QZdesk-D
 # 或者交互式选：./build.sh lunch
 ```
 
-> `qzcam` / `qzdesk` 的应用源码在各自独立的仓库里，通过 `project/app/*/src` 软链挂进来；
-> 没有它们时只有 SDK 自带的那几个 app（`rkipc`、`uvc_app_tiny` 等）能编。
+> **QZdesk**（桌面）和 **QZcam**（相机）是各自独立的仓库，通过 `project/app/*/src` 软链挂进来；
+> 这个 SDK 给它们提供交叉工具链、内核/rootfs，以及装进去的 `oem` 树。没有它们时，只有 SDK
+> 自带的那几个 app（`rkipc`、`uvc_app_tiny` 等）能编。
 
 ## 编译
 
